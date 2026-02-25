@@ -10,19 +10,13 @@ A [Goldsky Compose](https://docs.goldsky.com/compose) app that keeps RedStone or
 
 ## Setup
 
-1. Install dependencies:
-
-```sh
-npm install
-```
-
-2. Set the keeper secret (this is the private key of the wallet that will submit transactions):
+1. Set the keeper secret (this is the private key of the wallet that will submit transactions):
 
 ```sh
 goldsky compose secret set KEEPER_PRIVATE_KEY <your-private-key>
 ```
 
-3. Deploy:
+2. Deploy:
 
 ```sh
 goldsky compose deploy
