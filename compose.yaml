@@ -1,5 +1,5 @@
 name: "lisk-redstone-oracle"
-api_version: "internal-fix-esbuild-cjs-compat"
+api_version: "latest"
 
 secrets:
   - KEEPER_PRIVATE_KEY
