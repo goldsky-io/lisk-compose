@@ -70956,7 +70956,6 @@ ${describeContractData(await pricesAdapter.readContractData(paramsProvider.getDa
       throw new Error(`Chain "${chainName}" not found in evm.chains`);
     }
     const wallet = await evm.wallet({
-      privateKey: env.KEEPER_PRIVATE_KEY,
       name: "lisk-keeper"
     });
     await logEvent({

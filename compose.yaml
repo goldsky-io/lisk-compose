@@ -1,6 +1,5 @@
 name: "lisk-redstone-oracle"
 api_version: "preview"
-sponsor_gas: true
 
 env:
   cloud:
