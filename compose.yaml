@@ -1,8 +1,6 @@
 name: "lisk-redstone-oracle"
-api_version: "latest"
-
-secrets:
-  - KEEPER_PRIVATE_KEY
+api_version: "preview"
+sponsor_gas: true
 
 env:
   cloud:
