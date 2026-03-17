@@ -215,7 +215,6 @@ export async function main(
   }
 
   const wallet = await evm.wallet({
-    privateKey: env.KEEPER_PRIVATE_KEY,
     name: "lisk-keeper",
   });
 
