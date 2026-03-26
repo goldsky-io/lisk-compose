@@ -15,7 +15,7 @@ import {
   defaultAbiCoder,
 } from "ethers/lib/utils";
 import { WrapperBuilder } from "@redstone-finance/evm-connector";
-import { RedstonePayload } from "@redstone-finance/protocol";
+import { RedstonePayload, SignedDataPackage } from "@redstone-finance/protocol";
 import { getSignersForDataServiceId } from "@redstone-finance/sdk";
 
 // -- Types (imported from Compose task-types at deploy time) --
@@ -80,6 +80,108 @@ const MULTICALL3_ABI = [
   "function aggregate3((address target, bool allowFailure, bytes callData)[] calls) public payable returns ((bool success, bytes returnData)[] returnData)",
 ];
 
+// -- Custom ethers provider that routes RPC calls through context.fetch() --
+// The task process has no --allow-net, so ethers can't make direct HTTP calls.
+class ComposeFetchProvider extends providers.JsonRpcProvider {
+  private contextFetch: TaskContext["fetch"];
+  private _networkPromise: Promise<any> | null = null;
+
+  constructor(url: string, contextFetch: TaskContext["fetch"]) {
+    super(url);
+    this.contextFetch = contextFetch;
+  }
+
+  async send(method: string, params: any[]): Promise<any> {
+    const result = await this.contextFetch<{
+      jsonrpc: string;
+      id: number;
+      result?: any;
+      error?: { code: number; message: string };
+    }>(this.connection.url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+
+    if (!result) throw new Error(`RPC call ${method} returned undefined`);
+    if (result.error) throw new Error(result.error.message);
+    return result.result;
+  }
+
+  async detectNetwork(): Promise<any> {
+    if (!this._networkPromise) {
+      this._networkPromise = this.send("eth_chainId", []).then((chainIdHex: string) => {
+        const chainId = parseInt(chainIdHex, 16);
+        return { name: "lisk", chainId };
+      });
+    }
+    return this._networkPromise;
+  }
+}
+
+// -- Redstone gateway URLs (same as SDK defaults) --
+const REDSTONE_GATEWAY_URLS = [
+  "https://oracle-gateway-1.a.redstone.vip",
+  "https://oracle-gateway-1.a.redstone.finance",
+  "https://oracle-gateway-2.a.redstone.finance",
+];
+
+/**
+ * Fetch Redstone data packages via context.fetch() (IPC to host process).
+ * Bypasses the SDK's internal axios calls which fail due to no --allow-net.
+ */
+async function fetchDataPackages(
+  contextFetch: TaskContext["fetch"],
+  dataServiceId: string,
+  dataPackagesIds: string[],
+  authorizedSigners: string[],
+  uniqueSignersCount: number,
+): Promise<Record<string, SignedDataPackage[]>> {
+  let rawResponse: Record<string, any[]> | undefined;
+  const errors: string[] = [];
+
+  for (const baseUrl of REDSTONE_GATEWAY_URLS) {
+    const url = `${baseUrl}/v2/data-packages/latest/${dataServiceId}`;
+    try {
+      const resp = await contextFetch<Record<string, any[]>>(url);
+      if (resp) {
+        rawResponse = resp;
+        break;
+      }
+    } catch (err) {
+      errors.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  if (!rawResponse) {
+    throw new Error(`All Redstone gateways failed: ${errors.join("; ")}`);
+  }
+
+  // Filter and convert to SignedDataPackage instances
+  const result: Record<string, SignedDataPackage[]> = {};
+  const authorizedSet = new Set(authorizedSigners.map((s) => s.toLowerCase()));
+
+  for (const feedId of dataPackagesIds) {
+    const packages = rawResponse[feedId];
+    if (!packages || !Array.length) {
+      result[feedId] = [];
+      continue;
+    }
+
+    // Filter to authorized signers only
+    const authorized = packages.filter(
+      (p: any) => p.signerAddress && authorizedSet.has(p.signerAddress.toLowerCase()),
+    );
+
+    // Convert to SignedDataPackage class instances and take uniqueSignersCount
+    result[feedId] = authorized
+      .slice(0, uniqueSignersCount)
+      .map((p: any) => SignedDataPackage.fromObj(p));
+  }
+
+  return result;
+}
+
 // -- Helpers --
 
 /**
@@ -141,8 +243,18 @@ function extractLivePricesFromPayload(
               .padEnd(64, "0");
 
           if (feedIdHex.toLowerCase() === symbolBytes32.toLowerCase()) {
-            // dataPoint.value is the numeric value
-            const value = BigNumber.from(dataPoint.toObj().value);
+            // dataPoint.toObj().value is base64-encoded 32-byte big-endian uint
+            const objValue = dataPoint.toObj().value;
+            let value: BigNumber;
+            if (typeof objValue === "number" || typeof objValue === "bigint") {
+              value = BigNumber.from(objValue);
+            } else if (typeof objValue === "string") {
+              // base64 → bytes → BigNumber
+              const bytes = Uint8Array.from(atob(objValue), (c) => c.charCodeAt(0));
+              value = BigNumber.from(bytes);
+            } else {
+              value = BigNumber.from(objValue);
+            }
             prices.set(symbol, value);
             break;
           }
@@ -197,8 +309,9 @@ export async function main(
     }),
   });
 
-  // Create ethers provider for Redstone WrapperBuilder (needs ethers v5 provider)
-  const provider = new providers.JsonRpcProvider(rpcUrl);
+  // Custom provider that routes RPC calls through context.fetch() (IPC to host)
+  // since the task process has no --allow-net permission.
+  const provider = new ComposeFetchProvider(rpcUrl, context.fetch);
 
   // Create oracle contract instance (ethers v5 -- needed for WrapperBuilder)
   const oracle = new Contract(oracleAddress, ORACLE_ABI, provider);
@@ -234,13 +347,18 @@ export async function main(
     // Get authorized signers for the data service
     const authorizedSigners = getSignersForDataServiceId(dataServiceId as "redstone-primary-prod");
 
-    // Wrap the oracle contract with Redstone data service
-    const wrappedOracle = WrapperBuilder.wrap(oracle).usingDataService({
+    // Fetch data packages via context.fetch() (bypasses SDK's axios calls
+    // which fail in the sandboxed task process with no --allow-net)
+    const dataPackages = await fetchDataPackages(
+      context.fetch,
       dataServiceId,
-      uniqueSignersCount,
-      dataPackagesIds: symbols,
+      symbols,
       authorizedSigners,
-    });
+      uniqueSignersCount,
+    );
+
+    // Wrap the oracle contract with pre-fetched data packages
+    const wrappedOracle = WrapperBuilder.wrap(oracle).usingDataPackages(dataPackages);
 
     // Populate a transaction to get calldata with Redstone payload attached
     const tx = await wrappedOracle.populateTransaction.getLivePricesAndTimestamp(
@@ -471,12 +589,17 @@ export async function main(
   // Build the update transaction with fresh Redstone payload
   try {
     const authorizedSigners = getSignersForDataServiceId(dataServiceId as "redstone-primary-prod");
-    const wrappedOracle = WrapperBuilder.wrap(oracle).usingDataService({
+
+    // Fetch fresh data packages for the feeds that need updating
+    const updateDataPackages = await fetchDataPackages(
+      context.fetch,
       dataServiceId,
-      uniqueSignersCount,
-      dataPackagesIds: feedsToUpdate,
+      feedsToUpdate,
       authorizedSigners,
-    });
+      uniqueSignersCount,
+    );
+
+    const wrappedOracle = WrapperBuilder.wrap(oracle).usingDataPackages(updateDataPackages);
 
     // Get calldata with Redstone-signed payload for the feeds that need updating
     const updateTx =
