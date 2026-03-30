@@ -1,5 +1,5 @@
 name: "lisk-redstone-oracle"
-api_version: "preview"
+api_version: "0.2.0"
 
 env:
   cloud:
