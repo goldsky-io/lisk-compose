@@ -2,6 +2,7 @@
   "name": "lisk-redstone-oracle",
   "private": true,
   "engines": {
+    "node": ">=20.0.0",
     "npm": ">=11.10.0"
   },
   "dependencies": {

@@ -5,7 +5,7 @@ A [Goldsky Compose](https://docs.goldsky.com/compose) app that keeps RedStone or
 ## Prerequisites
 
 - [Goldsky CLI](https://docs.goldsky.com/get-started/cli) installed and authenticated
-- Node.js (for `npm install`)
+- Node.js >= 20 with npm >= 11.10.0 (for `npm install`)
 
 ## Setup
 
