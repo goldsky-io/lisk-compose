@@ -72,7 +72,7 @@ type TaskContext = {
 
 const ORACLE_ABI = [
   "function updateDataFeedsValuesPartial(bytes32[]) public",
-  "function getLastUpdateDetails(bytes32) public view returns (uint256, uint256, uint256)",
+  "function getLastUpdateDetails(bytes32) public view returns (uint256 lastDataTimestamp, uint256 lastBlockTimestamp, uint256 lastValue)",
   "function getLivePricesAndTimestamp(bytes32[]) public view returns (uint256[], uint256)",
 ];
 
@@ -434,13 +434,14 @@ export async function main(
     for (let i = 0; i < symbols.length; i++) {
       const result = results[i];
       if (result.success) {
-        // Decode: returns (uint256 price, uint256 timestamp, uint256 blockNumber)
+        // RedStone MultiFeedAdapter returns (lastDataTimestamp, lastBlockTimestamp, lastValue).
+        // Staleness is measured against lastBlockTimestamp (when the update landed on-chain).
         const decoded = defaultAbiCoder.decode(
           ["uint256", "uint256", "uint256"],
           result.returnData,
         );
         storedPrices.set(symbols[i], {
-          price: decoded[0] as BigNumber,
+          price: decoded[2] as BigNumber,
           timestamp: (decoded[1] as BigNumber).toNumber(),
         });
       } else {
