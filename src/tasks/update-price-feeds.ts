@@ -327,8 +327,17 @@ export async function main(
     throw new Error(`Chain "${chainName}" not found in evm.chains`);
   }
 
+  // Hybrid gas strategy: prefer a sponsored ERC-4337 UserOp (free), but fall
+  // back to a self-paid EIP-1559 tx from the same Privy wallet when sponsoring
+  // fails. Lisk's only sponsoring bundler is Gelato, which has thrown
+  // intermittent "internal error" on userOps and stalled updates for hours; the
+  // direct path keeps prices flowing through those outages, so the keeper
+  // wallet must stay funded with gas. A circuit breaker (persisted in the
+  // "sponsor_breaker" collection) skips the sponsored attempt for a cooldown
+  // after repeated failures so each cron run doesn't burn time on a dead bundler.
   const wallet = await evm.wallet({
     name: "lisk-keeper",
+    sponsorGas: false,
   });
 
   await logEvent({
@@ -617,18 +626,80 @@ export async function main(
       }),
     });
 
-    // Send the raw calldata transaction via Compose wallet
-    const result = await wallet.sendTransaction({
+    // Send the raw calldata transaction: sponsored first (unless the breaker
+    // is open), self-paid EOA fallback second.
+    const BREAKER_MAX_FAILURES = 3;
+    const BREAKER_COOLDOWN_MS = 30 * 60 * 1000;
+
+    const txConfig = {
       to: oracleAddress as `0x${string}`,
       data: updateTx.data as `0x${string}`,
       chain,
-    });
+    };
+
+    const breaker = await collection<{ failures: number; openUntil: number }>(
+      "sponsor_breaker",
+    );
+    const breakerState = await breaker.findOne({});
+    const failures = breakerState?.failures ?? 0;
+    const openUntil = breakerState?.openUntil ?? 0;
+
+    let result: { hash: string; receipt: unknown } | undefined;
+    let gasSponsored = false;
+
+    if (Date.now() >= openUntil) {
+      try {
+        const sponsoredWallet = await evm.wallet({
+          name: "lisk-keeper", // same address; sponsorGas defaults to true
+        });
+        result = await sponsoredWallet.sendTransaction(txConfig);
+        gasSponsored = true;
+        if (breakerState && (failures > 0 || openUntil > 0)) {
+          await breaker.setById(breakerState.id, { failures: 0, openUntil: 0 });
+        }
+      } catch (sponsorErr) {
+        const sponsorMessage =
+          sponsorErr instanceof Error ? sponsorErr.message : String(sponsorErr);
+        const newFailures = failures + 1;
+        const newOpenUntil =
+          newFailures >= BREAKER_MAX_FAILURES
+            ? Date.now() + BREAKER_COOLDOWN_MS
+            : 0;
+        const newState = { failures: newFailures, openUntil: newOpenUntil };
+        if (breakerState) {
+          await breaker.setById(breakerState.id, newState);
+        } else {
+          await breaker.insertOne(newState);
+        }
+        await logEvent({
+          code: "keeper.sponsor_failed",
+          message:
+            `Gas-sponsored send failed (${newFailures} consecutive), ` +
+            `falling back to self-paid EOA tx` +
+            (newOpenUntil
+              ? `; breaker open for ${BREAKER_COOLDOWN_MS / 60000} min`
+              : ""),
+          data: JSON.stringify({ error: sponsorMessage, ...newState }),
+        });
+      }
+    } else {
+      await logEvent({
+        code: "keeper.sponsor_skipped",
+        message: `Gas sponsoring skipped, breaker open until ${new Date(openUntil).toISOString()}`,
+        data: JSON.stringify({ failures, openUntil }),
+      });
+    }
+
+    if (!result) {
+      result = await wallet.sendTransaction(txConfig);
+    }
 
     await logEvent({
       code: "keeper.update_sent",
-      message: `Update transaction sent successfully`,
+      message: `Update transaction sent successfully (${gasSponsored ? "gas-sponsored" : "self-paid"})`,
       data: JSON.stringify({
         txHash: result.hash,
+        gasSponsored,
         feeds: feedsToUpdate,
         feedCount: feedsToUpdate.length,
       }),
@@ -641,6 +712,7 @@ export async function main(
         feedsUpdated: string[];
         txHash: string;
         feedCount: number;
+        gasSponsored: boolean;
         comparisons: typeof comparisons;
       }>("update_history");
 
@@ -649,6 +721,7 @@ export async function main(
         feedsUpdated: feedsToUpdate,
         txHash: result.hash,
         feedCount: feedsToUpdate.length,
+        gasSponsored,
         comparisons,
       });
     } catch (colErr) {
@@ -663,6 +736,7 @@ export async function main(
 
     return {
       status: "updated",
+      gasSponsored,
       feedsChecked: symbols.length,
       feedsUpdated: feedsToUpdate.length,
       feeds: feedsToUpdate,
